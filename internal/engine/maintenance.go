@@ -5,9 +5,9 @@ import (
 	"lamina/internal/index"
 	"lamina/internal/journal"
 	"lamina/internal/snapshot"
-	"lamina/internal/versions"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 func (d *DB) image() snapshot.Image {
@@ -70,27 +70,50 @@ func Restore(dir string, data []byte) error {
 	installed = true
 	return nil
 }
-func (d *DB) Vacuum(requested uint64) (versions.VacuumResult, error) {
+
+// VacuumReport extends the version-store counts with the real ownership of
+// the retention horizon: when readers block pruning, PinningReaders names the
+// in-flight transactions whose snapshots hold history back.
+type VacuumReport struct {
+	Horizon        uint64      `json:"horizon"`
+	Removed        int         `json:"removed"`
+	Retained       int         `json:"retained"`
+	Pinned         bool        `json:"pinned"`
+	Requested      uint64      `json:"requested_horizon"`
+	PinningReaders []ReaderPin `json:"pinning_readers"`
+}
+
+func (d *DB) Vacuum(requested uint64) (VacuumReport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
-		return versions.VacuumResult{}, err
+		return VacuumReport{}, err
 	}
 	if requested > d.sequence || requested < d.horizon {
-		return versions.VacuumResult{}, fault("invalid", "vacuum horizon outside retained interval")
+		return VacuumReport{}, fault("invalid", "vacuum horizon outside retained interval")
 	}
 	horizon := requested
-	for _, tx := range d.transactions {
+	pinners := []ReaderPin{}
+	ids := make([]string, 0, len(d.transactions))
+	for id := range d.transactions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		tx := d.transactions[id]
 		if tx.Snapshot < horizon {
 			horizon = tx.Snapshot
+			if len(pinners) < maxRetainedPins {
+				pinners = append(pinners, ReaderPin{Transaction: tx.ID, Snapshot: tx.Snapshot, ReadOnly: tx.ReadOnly})
+			}
 		}
 	}
 	beforeKeys, beforeVersions := d.store.Count()
 	_ = beforeKeys
 	if err := d.publish(journal.Record{Kind: "vacuum", Horizon: horizon}); err != nil {
-		return versions.VacuumResult{}, err
+		return VacuumReport{}, err
 	}
 	_, remaining := d.store.Count()
 	d.indexes = index.Build(d.catalog, d.store)
-	return versions.VacuumResult{Horizon: horizon, Removed: beforeVersions - remaining, Retained: remaining, Pinned: horizon < requested}, nil
+	return VacuumReport{Horizon: horizon, Removed: beforeVersions - remaining, Retained: remaining, Pinned: horizon < requested, Requested: requested, PinningReaders: pinners}, nil
 }

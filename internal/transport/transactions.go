@@ -57,11 +57,12 @@ func (s *Server) commit(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, out)
 }
 func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
-	if err := s.db.Rollback(r.PathValue("tx")); err != nil {
+	out, err := s.db.Rollback(r.PathValue("tx"))
+	if err != nil {
 		respondError(w, err)
 		return
 	}
-	write(w, 200, map[string]string{"state": "rolled_back"})
+	write(w, 200, out)
 }
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	var in struct {

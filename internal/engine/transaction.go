@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"lamina/internal/datum"
 	"lamina/internal/journal"
 	"lamina/internal/versions"
@@ -24,6 +25,10 @@ type Transaction struct {
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
 	Writes   int    `json:"writes"`
+	// Close is present on every terminal commit response, including empty
+	// transactions, so callers can distinguish "nothing staged" from "private
+	// writes released" and observe who still pins history.
+	Close CloseReport `json:"close"`
 }
 
 func (d *DB) Begin(readOnly bool) (Transaction, error) {
@@ -140,17 +145,22 @@ func (d *DB) Delete(id, table string, value datum.Value) error {
 	tx.writes[table][key] = staged{Mutation: versions.Mutation{Relation: table, Key: key, Deleted: true}}
 	return nil
 }
-func (d *DB) Rollback(id string) error {
+
+// Rollback closes a transaction with an explicit rolled_back outcome. The
+// returned report enumerates the discarded private mutations (with bounded
+// key references for immediate retry) and the retention ownership that
+// remains after this transaction's snapshot pin is released.
+func (d *DB) Rollback(id string) (CloseReport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
-		return err
+		return CloseReport{}, err
 	}
-	if _, err := d.tx(id); err != nil {
-		return err
+	tx, err := d.tx(id)
+	if err != nil {
+		return CloseReport{}, err
 	}
-	delete(d.transactions, id)
-	return nil
+	return d.closeLocked(tx, outcomeRolledBack, true), nil
 }
 func (d *DB) Commit(id string) (Commit, error) {
 	d.mu.Lock()
@@ -162,23 +172,31 @@ func (d *DB) Commit(id string) (Commit, error) {
 	if err != nil {
 		return Commit{}, err
 	}
-	defer delete(d.transactions, id)
 	writes := make([]versions.Mutation, 0)
 	for table, mutations := range tx.writes {
 		for key, m := range mutations {
 			if d.store.Latest(table, key) > tx.Snapshot {
 				d.conflicts++
-				return Commit{}, fault("conflict", "write conflict on %s", table)
+				report := d.closeLocked(tx, outcomeConflict, true)
+				return Commit{}, &Error{Code: "conflict", Message: fmt.Sprintf("write conflict on %s; transaction closed, private writes discarded", table), Detail: report}
 			}
 			writes = append(writes, m.Mutation)
 		}
 		if err = d.unique(table, tx.writes); err != nil {
 			d.conflicts++
-			return Commit{}, err
+			report := d.closeLocked(tx, outcomeConflict, true)
+			if domain, ok := err.(*Error); ok {
+				domain.Detail = report
+				return Commit{}, domain
+			}
+			return Commit{}, &Error{Code: "conflict", Message: err.Error(), Detail: report}
 		}
 	}
 	if len(writes) == 0 {
-		return Commit{Sequence: tx.Snapshot}, nil
+		// An empty end is not a rollback: nothing was discarded, but the
+		// snapshot pin is released all the same.
+		report := d.closeLocked(tx, outcomeEmpty, false)
+		return Commit{Sequence: tx.Snapshot, Writes: 0, Close: report}, nil
 	}
 	sort.Slice(writes, func(i, j int) bool {
 		if writes[i].Relation == writes[j].Relation {
@@ -187,8 +205,17 @@ func (d *DB) Commit(id string) (Commit, error) {
 		return writes[i].Relation < writes[j].Relation
 	})
 	if err = d.publish(journal.Record{Kind: "commit", Transaction: id, Writes: writes}); err != nil {
+		// The durable outcome is uncertain. The instance is poisoned and will
+		// reject further requests; this transaction cannot be reused. Its
+		// private writes are not declared discarded because they may have been
+		// made durable before the failure. Restart and reconcile.
+		report := d.closeLocked(tx, outcomeDurableUncertain, false)
+		if domain, ok := err.(*Error); ok {
+			domain.Detail = report
+		}
 		return Commit{}, err
 	}
 	d.commits++
-	return Commit{Sequence: d.sequence, Writes: len(writes)}, nil
+	report := d.closeLocked(tx, outcomeCommitted, false)
+	return Commit{Sequence: d.sequence, Writes: len(writes), Close: report}, nil
 }

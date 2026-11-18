@@ -77,7 +77,11 @@ func respondError(w http.ResponseWriter, err error) {
 		slog.Error("request failed", "error", err)
 		message = "internal database error"
 	}
-	write(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
+	payload := map[string]any{"code": code, "message": message}
+	if domain != nil && domain.Detail != nil {
+		payload["detail"] = domain.Detail
+	}
+	write(w, status, map[string]any{"error": payload})
 }
 func (s *Server) routes() {
 	const p = "/v1/lamina"

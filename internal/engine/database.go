@@ -13,19 +13,20 @@ import (
 )
 
 type DB struct {
-	mu           sync.RWMutex
-	dir          string
-	catalog      *catalog.Catalog
-	store        *versions.Store
-	indexes      *index.Registry
-	wal          *journal.WAL
-	sequence     uint64
-	horizon      uint64
-	transactions map[string]*Transaction
-	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	mu            sync.RWMutex
+	dir           string
+	catalog       *catalog.Catalog
+	store         *versions.Store
+	indexes       *index.Registry
+	wal           *journal.WAL
+	sequence      uint64
+	horizon       uint64
+	transactions  map[string]*Transaction
+	closedHistory []CloseEvent
+	closed        bool
+	commits       uint64
+	conflicts     uint64
+	queries       uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -47,7 +48,7 @@ func Open(dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
+	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}, closedHistory: []CloseEvent{}}
 	if !missing {
 		d.catalog = image.Catalog
 		d.store = image.Store
@@ -94,6 +95,7 @@ func (d *DB) Close() error {
 	}
 	d.closed = true
 	d.transactions = map[string]*Transaction{}
+	d.closedHistory = []CloseEvent{}
 	return d.wal.Close()
 }
 func (d *DB) publish(r journal.Record) error {

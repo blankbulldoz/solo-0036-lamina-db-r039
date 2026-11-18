@@ -5,6 +5,7 @@ import "sort"
 type Stats struct {
 	Sequence       uint64         `json:"sequence"`
 	Horizon        uint64         `json:"horizon"`
+	RetentionFloor uint64         `json:"retention_floor"`
 	Active         []Transaction  `json:"active"`
 	Keys           int            `json:"keys"`
 	Versions       int            `json:"versions"`
@@ -15,6 +16,10 @@ type Stats struct {
 	Commits        uint64         `json:"commits_since_open"`
 	Conflicts      uint64         `json:"conflicts_since_open"`
 	Queries        uint64         `json:"queries_since_open"`
+	// Closed is a bounded, sanitized ring of recent transaction ends. It
+	// contains counts and retention ownership only; no row payloads or key
+	// material are retained, and old events age out as new transactions close.
+	Closed []CloseEvent `json:"closed"`
 }
 
 func (d *DB) Stats() (Stats, error) {
@@ -24,13 +29,18 @@ func (d *DB) Stats() (Stats, error) {
 		return Stats{}, err
 	}
 	keys, versions := d.store.Count()
-	s := Stats{Sequence: d.sequence, Horizon: d.horizon, Keys: keys, Versions: versions, Active: []Transaction{}, IndexEntries: map[string]int{}, JournalRecords: len(d.wal.Records), HistoryBase: d.wal.Base, RecoveredTail: d.wal.RecoveredTail, Commits: d.commits, Conflicts: d.conflicts, Queries: d.queries}
+	floor := d.sequence
+	s := Stats{Sequence: d.sequence, Horizon: d.horizon, RetentionFloor: floor, Keys: keys, Versions: versions, Active: []Transaction{}, IndexEntries: map[string]int{}, JournalRecords: len(d.wal.Records), HistoryBase: d.wal.Base, RecoveredTail: d.wal.RecoveredTail, Commits: d.commits, Conflicts: d.conflicts, Queries: d.queries, Closed: []CloseEvent{}}
 	for _, tx := range d.transactions {
 		copy := *tx
 		copy.writes = nil
 		s.Active = append(s.Active, copy)
+		if tx.Snapshot < s.RetentionFloor {
+			s.RetentionFloor = tx.Snapshot
+		}
 	}
 	sort.Slice(s.Active, func(i, j int) bool { return s.Active[i].ID < s.Active[j].ID })
+	s.Closed = append(s.Closed, d.closedHistory...)
 	for name, t := range d.indexes.Trees {
 		s.IndexEntries[name] = t.Size()
 	}

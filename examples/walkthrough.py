@@ -144,9 +144,36 @@ def walkthrough(name,binary):
     require(reclaimed['removed']>=1,'obsolete version not reclaimed');s.call('POST','/query',{'relation':'spectra','at':seed_seq},410)
     s.call('POST','/checkpoint');s.stop();s.start();require(s.query()['rows'][0]['amplitude']==99,'vacuum did not survive restart');observations={'pinned':pinned,'reclaimed':reclaimed}
    elif name=='transaction-close':
-    tx=s.begin();s.put(tx,tuple_(8));s.call('POST',f'/transactions/{tx}/rollback');s.commit(tx,404)
+    tx=s.begin();s.put(tx,tuple_(8));report=s.call('POST',f'/transactions/{tx}/rollback');s.commit(tx,404)
+    require(report['outcome']=='rolled_back','rollback outcome not distinguished')
+    require(report['discarded']['mutations']==1 and report['discarded']['puts']==1
+     and report['discarded']['relations'][0]['relation']=='spectra'
+     and report['discarded']['keys'][0]['key']=='int:8' and not report['discarded']['keys_truncated'],'discarded private write not accounted')
+    require(report['retention']['active_readers']==0 and report['retention']['retention_floor']==s.stats()['sequence'],'released pin still reported as held')
     require(s.query()['matched']==7 and not s.stats()['active'],'rollback leaked state or pin')
-    tx=s.begin(True);s.put(tx,tuple_(9),409);s.call('POST',f'/transactions/{tx}/rollback');observations={'rollback':'discarded','read_only':'enforced'}
+    stats=s.stats();require(stats['retention_floor']==stats['sequence'] and stats['closed'][-1]['outcome']=='rolled_back','stats missing bounded close history')
+    require('keys' not in stats['closed'][-1]['discarded'],'diagnostic history retained key material')
+    empty=s.begin();empty_report=s.commit(empty)
+    require(empty_report['close']['outcome']=='empty' and empty_report['close']['discarded']['mutations']==0
+     and empty_report['writes']==0,'empty transaction end conflated with rollback')
+    blocker=s.begin(True);blocker_snapshot=s.stats()['active'][0]['snapshot']
+    writer=s.begin();s.put(writer,tuple_(1,amplitude=77));s.commit(writer)
+    requested=s.stats()['sequence'];vacuum=s.call('POST','/vacuum',{'horizon':requested})
+    require(vacuum['pinned'] and vacuum['pinning_readers'][0]['transaction']==blocker
+     and vacuum['pinning_readers'][0]['snapshot']==blocker_snapshot,'vacuum did not name the reader holding history')
+    closer=s.begin();s.put(closer,tuple_(9));closed=s.call('POST',f'/transactions/{closer}/rollback')
+    require(closed['retention']['active_readers']==1 and closed['retention']['pinning_readers'][0]['transaction']==blocker
+     and closed['retention']['retention_floor']==blocker_snapshot,'close report hid history still occupied by another read')
+    s.call('POST',f'/transactions/{blocker}/rollback');freed=s.call('POST','/vacuum',{'horizon':requested})
+    require(not freed['pinned'] and not freed['pinning_readers'] and freed['removed']>=1,'release not verifiable through subsequent vacuum')
+    loser=s.begin();winner=s.begin();s.put(loser,tuple_(2,amplitude=303));s.put(winner,tuple_(2,amplitude=404));s.commit(winner)
+    failed=s.call('POST',f'/transactions/{loser}/commit',status=409)
+    require(failed['error']['detail']['outcome']=='commit_rejected' and failed['error']['detail']['discarded']['mutations']==1
+     and failed['error']['detail']['discarded']['keys'][0]['key']=='int:2','failed commit hid discarded writes or retry context')
+    s.commit(loser,404)
+    tx=s.begin(True);s.put(tx,tuple_(9),409);ro=s.call('POST',f'/transactions/{tx}/rollback')
+    require(ro['read_only'] and ro['discarded']['mutations']==0,'read-only rollback misreported')
+    observations={'rollback':report,'empty':empty_report['close'],'blocked_vacuum':vacuum,'freed_vacuum':freed,'rejected_commit':failed['error']['detail'],'read_only':'enforced'}
    elif name=='statistics':
     s.call('POST','/indexes',{'name':'by_amp','relation':'spectra','column':'amplitude'},201)
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
